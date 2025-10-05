@@ -1,19 +1,45 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
-const cors = require('cors');
+const cors = require('cors'); // Ensure cors is installed: npm install cors
 
 const app = express();
-const PORT = 3001;
+
+// --- MODIFICATION 1: Use Render's PORT environment variable or fallback for local dev ---
+const PORT = process.env.PORT || 3001;
+
+// --- MODIFICATION 2: Explicit CORS Configuration for better security and clarity ---
+// Your deployed frontend URL is: https://helpdesk-react-frontend.onrender.com
+const allowedOrigins = [
+    'http://localhost:3000', // Your frontend's local development URL
+    'https://helpdesk-react-frontend.onrender.com' // Your deployed Render frontend URL
+    // Add any other specific domains if your frontend might be accessed from them (e.g., custom domains)
+];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps, Postman, or curl requests)
+        // or requests from the allowed origins list.
+        if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+            callback(new Error(msg), false);
+        }
+    },
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Define the HTTP methods your API supports
+    credentials: true, // Set to true if your frontend needs to send cookies or authorization headers
+    optionsSuccessStatus: 200 // Some legacy browsers (IE11, various SmartTVs) choke on 204
+}));
+
 
 // --- Middleware ---
-app.use(cors());
 app.use(express.json());
 
 // --- Database Setup ---
 const db = new sqlite3.Database('./helpdesk.db', (err) => {
     if (err) {
-        console.error(err.message);
+        console.error("Database connection error:", err.message);
     }
     console.log('Connected to the helpdesk.db SQLite database.');
 });
@@ -47,8 +73,8 @@ db.run(`CREATE TABLE IF NOT EXISTS Tickets (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     due_date DATETIME, -- New field for SLA
     version INTEGER DEFAULT 1, -- New field for optimistic locking
-    FOREIGN KEY (created_by_user_id) REFERENCES Users (id),
-    FOREIGN KEY (assigned_to_user_id) REFERENCES Users (id)
+    FOREIGN KEY (created_by_user_id) REFERENCES Users (id) ON DELETE SET NULL, -- Added ON DELETE SET NULL
+    FOREIGN KEY (assigned_to_user_id) REFERENCES Users (id) ON DELETE SET NULL -- Added ON DELETE SET NULL
 )`, (err) => {
     if (err) {
         console.error("Error creating Tickets table:", err.message);
@@ -64,8 +90,8 @@ db.run(`CREATE TABLE IF NOT EXISTS Comments (
     ticket_id INTEGER,
     user_id INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (ticket_id) REFERENCES Tickets (id),
-    FOREIGN KEY (user_id) REFERENCES Users (id)
+    FOREIGN KEY (ticket_id) REFERENCES Tickets (id) ON DELETE CASCADE, -- Added ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES Users (id) ON DELETE SET NULL -- Added ON DELETE SET NULL
 )`, (err) => {
     if (err) {
         console.error("Error creating Comments table:", err.message);
@@ -82,8 +108,8 @@ db.run(`CREATE TABLE IF NOT EXISTS TicketActions (
     action TEXT NOT NULL, -- e.g., 'created', 'status_changed', 'assigned', 'commented'
     details TEXT, -- e.g., 'status: open -> in_progress', 'assigned_to: AgentName'
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (ticket_id) REFERENCES Tickets (id),
-    FOREIGN KEY (user_id) REFERENCES Users (id)
+    FOREIGN KEY (ticket_id) REFERENCES Tickets (id) ON DELETE CASCADE, -- Added ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES Users (id) ON DELETE SET NULL -- Added ON DELETE SET NULL
 )`, (err) => {
     if (err) {
         console.error("Error creating TicketActions table:", err.message);
@@ -138,12 +164,17 @@ app.post('/api/register', async (req, res) => {
         const sql = `INSERT INTO Users (name, username, email, password, role) VALUES (?, ?, ?, ?, ?)`;
         db.run(sql, [name, username, email, hashedPassword, role], function(err) {
             if (err) {
-                return res.status(400).json({ error: 'Username or email already exists' });
+                // Check if the error is due to unique constraint violation
+                if (err.message.includes('UNIQUE constraint failed')) {
+                    return res.status(400).json({ error: 'Username or email already exists' });
+                }
+                return res.status(500).json({ error: 'Server error during registration: ' + err.message });
             }
             res.status(201).json({ message: 'User created successfully', userId: this.lastID });
         });
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        console.error("Registration error:", error);
+        res.status(500).json({ error: 'Server error during registration' });
     }
 });
 
@@ -156,7 +187,8 @@ app.post('/api/login', (req, res) => {
     const sql = `SELECT * FROM Users WHERE email = ? OR username = ?`;
     db.get(sql, [loginIdentifier, loginIdentifier], async (err, user) => {
         if (err) {
-            return res.status(500).json({ error: 'Server error' });
+            console.error("Login database error:", err);
+            return res.status(500).json({ error: 'Server error during login' });
         }
         if (!user) {
             return res.status(401).json({ error: 'Invalid credentials' });
@@ -182,6 +214,7 @@ app.get('/api/users', (req, res) => {
 
     db.all(sql, params, (err, users) => {
         if (err) {
+            console.error("Error fetching users:", err.message);
             return res.status(500).json({ error: 'Server error fetching users: ' + err.message });
         }
         res.status(200).json({ users });
@@ -195,6 +228,7 @@ app.get('/api/users/:id', (req, res) => {
     const sql = `SELECT id, name, username, email, role FROM Users WHERE id = ?`;
     db.get(sql, [id], (err, user) => {
         if (err) {
+            console.error("Error fetching user by ID:", err.message);
             return res.status(500).json({ error: 'Server error' });
         }
         if (!user) {
@@ -231,6 +265,7 @@ app.patch('/api/users/:id', async (req, res) => {
             fieldsToUpdate.push('password = ?');
             params.push(hashedPassword);
         } catch (error) {
+            console.error("Error hashing password for user update:", error);
             return res.status(500).json({ error: 'Error hashing new password' });
         }
     }
@@ -247,6 +282,7 @@ app.patch('/api/users/:id', async (req, res) => {
             if (err.message.includes('UNIQUE constraint failed')) {
                 return res.status(400).json({ error: 'Username or email already taken.' });
             }
+            console.error("Failed to update user:", err.message);
             return res.status(500).json({ error: 'Failed to update user: ' + err.message });
         }
         if (this.changes === 0) {
@@ -286,10 +322,11 @@ app.post('/api/tickets', (req, res) => {
     const sql = `INSERT INTO Tickets (title, description, created_by_user_id, priority, due_date) VALUES (?, ?, ?, ?, ?)`;
     db.run(sql, [title, description, created_by_user_id, priority, due_date], function(err) {
         if (err) {
+            console.error("Failed to create ticket:", err.message);
             return res.status(500).json({ error: 'Failed to create ticket: ' + err.message });
         }
         const ticketId = this.lastID;
-        addTicketAction(ticketId, created_by_user_id, 'created', `Ticket created with priority: ${priority}`); // FIXED HERE
+        addTicketAction(ticketId, created_by_user_id, 'created', `Ticket created with priority: ${priority}`);
         res.status(201).json({ message: 'Ticket created successfully', ticketId });
     });
 });
@@ -360,9 +397,9 @@ app.get('/api/tickets', (req, res) => {
         const searchTerm = `%${search}%`;
         // Search in title, description, creator name, and comments
         whereClauses.push(`(
-            t.title LIKE ? OR 
-            t.description LIKE ? OR 
-            u.name LIKE ? OR 
+            t.title LIKE ? OR
+            t.description LIKE ? OR
+            u.name LIKE ? OR
             EXISTS (SELECT 1 FROM Comments cx WHERE cx.ticket_id = t.id AND cx.content LIKE ?)
         )`);
         params.push(searchTerm, searchTerm, searchTerm, searchTerm);
@@ -422,6 +459,7 @@ app.get('/api/tickets/:id', (req, res) => {
         WHERE t.id = ?`;
     db.get(sql, [id], (err, row) => {
         if (err) {
+            console.error("Error fetching single ticket:", err.message);
             return res.status(500).json({ error: 'Server error: ' + err.message });
         }
         if (!row) {
@@ -481,9 +519,10 @@ app.patch('/api/tickets/:id', async (req, res) => {
                 case 'high': now.setHours(now.getHours() + 4); break;
                 case 'medium': now.setHours(now.getHours() + 24); break;
                 case 'low': now.setDate(now.getDate() + 3); break;
-                default: now = null; break; // Use null if no specific due date rule
+                default: newDueDate = null; break; // Use null if no specific due date rule
             }
-            newDueDate = now ? now.toISOString() : null;
+            if (newDueDate !== null) newDueDate = now.toISOString();
+
             fieldsToUpdate.push('due_date = ?');
             params.push(newDueDate);
         }
@@ -528,7 +567,7 @@ app.patch('/api/tickets/:id', async (req, res) => {
             }
 
             actions.forEach(actionObj => {
-                addTicketAction(id, updater_user_id, actionObj.action_type, actionObj.details); // FIXED HERE
+                addTicketAction(id, updater_user_id, actionObj.action_type, actionObj.details);
             });
             res.status(200).json({ message: 'Ticket updated successfully', newVersion: existingTicket.version + 1 });
         });
@@ -549,6 +588,7 @@ app.post('/api/tickets/:id/comments', (req, res) => {
     const sql = `INSERT INTO Comments (ticket_id, user_id, content) VALUES (?, ?, ?)`;
     db.run(sql, [ticket_id, user_id, content], function(err) {
         if (err) {
+            console.error("Failed to add comment:", err.message);
             return res.status(500).json({ error: 'Failed to add comment: ' + err.message });
         }
         addTicketAction(ticket_id, user_id, 'commented', content);
@@ -568,6 +608,7 @@ app.get('/api/tickets/:id/comments', (req, res) => {
         ORDER BY c.created_at ASC`;
     db.all(sql, [ticket_id], (err, rows) => {
         if (err) {
+            console.error("Failed to retrieve comments:", err.message);
             return res.status(500).json({ error: 'Failed to retrieve comments: ' + err.message });
         }
         res.status(200).json({ comments: rows });
@@ -586,6 +627,7 @@ app.get('/api/tickets/actions/:id', (req, res) => {
         ORDER BY ta.created_at ASC`;
     db.all(sql, [ticket_id], (err, rows) => {
         if (err) {
+            console.error("Failed to retrieve ticket actions:", err.message);
             return res.status(500).json({ error: 'Failed to retrieve ticket actions: ' + err.message });
         }
         res.status(200).json({ actions: rows });
@@ -597,10 +639,10 @@ app.get('/api/tickets/actions/:id', (req, res) => {
 app.delete('/api/tickets/:id', (req, res) => {
     const { id } = req.params;
     db.serialize(() => { // Ensure operations run in sequence
-        db.run('PRAGMA foreign_keys = ON;'); // Enable foreign key constraints for cascading deletes
+        db.run('PRAGMA foreign_keys = ON;'); // Enable foreign key constraints for cascading deletes (ensure your SQLite version supports this and it's truly effective)
 
-        // The ON DELETE CASCADE on foreign keys should handle these,
-        // but explicit deletes ensure it if cascade isn't fully set up or for clarity.
+        // With ON DELETE CASCADE added to table creation, explicit deletes might not be strictly needed,
+        // but it doesn't hurt and adds a layer of robustness if the cascade isn't fully active.
         db.run(`DELETE FROM Comments WHERE ticket_id = ?`, [id], (err) => {
             if (err) console.error("Error deleting comments for ticket:", err.message);
         });
@@ -610,6 +652,7 @@ app.delete('/api/tickets/:id', (req, res) => {
 
         db.run(`DELETE FROM Tickets WHERE id = ?`, [id], function(err) {
             if (err) {
+                console.error("Failed to delete ticket:", err.message);
                 return res.status(500).json({ error: 'Failed to delete ticket: ' + err.message });
             }
             if (this.changes === 0) {
@@ -631,6 +674,7 @@ app.delete('/api/comments/:id', (req, res) => {
     }
     db.get('SELECT role FROM Users WHERE id = ?', [adminId], (err, user) => {
         if (err || !user) {
+            console.error("Error verifying admin for comment delete:", err ? err.message : 'User not found');
             return res.status(400).json({ error: 'Invalid Admin ID or user not found.' });
         }
         if (user.role !== 'admin') {
@@ -638,6 +682,7 @@ app.delete('/api/comments/:id', (req, res) => {
         }
         db.run(`DELETE FROM Comments WHERE id = ?`, [commentId], function(err) {
             if (err) {
+                console.error("Failed to delete comment:", err.message);
                 return res.status(500).json({ error: 'Failed to delete comment: ' + err.message });
             }
             if (this.changes === 0) {
@@ -648,8 +693,8 @@ app.delete('/api/comments/:id', (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => { // <--- THIS IS THE CRITICAL CHANGE
+    console.log(`Server is running on port ${PORT}`); // <--- ALSO UPDATED THIS LOG MESSAGE
 });
 
 module.exports = app;
