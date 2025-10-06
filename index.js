@@ -116,7 +116,32 @@ const getSLAStatus = (ticket) => {
     return 'on_track';
 };
 
+// --- TEMPORARY ADMIN CREATION ENDPOINT ---
+app.get('/api/setup-admin-user-temp', async (req, res) => {
+    const name = 'admin';
+    const username = 'admin123';
+    const email = 'admin@mail.com';
+    const password = 'admin123';
+    const role = 'admin';
 
+    try {
+        // First, check if the admin user already exists
+        const existingUser = await pool.query('SELECT * FROM Users WHERE username = $1 OR email = $2', [username, email]);
+        if (existingUser.rows.length > 0) {
+            return res.status(409).send('Admin user already exists.');
+        }
+
+        // If not, create the user
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const sql = `INSERT INTO Users (name, username, email, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
+        await pool.query(sql, [name, username, email, hashedPassword, role]);
+        res.status(201).send('Admin user created successfully! You can now log in.');
+
+    } catch (err) {
+        console.error("Error creating admin user:", err);
+        res.status(500).send('Server error while creating admin user.');
+    }
+});
 // --- API Endpoints (All converted to PostgreSQL) ---
 
 app.get('/api/health', (req, res) => {
