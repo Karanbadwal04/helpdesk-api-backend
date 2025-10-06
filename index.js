@@ -380,7 +380,7 @@ app.get('/api/tickets', async (req, res) => {
 
 
 // Get a single ticket by ID
-app.get('/api/tickets/:id', async (req, res) => {
+aapp.get('/api/tickets/:id', async (req, res) => {
     const { id } = req.params;
     const sql = `
         SELECT t.*, creator.name as creator_name, agent.name as assigned_agent_name
@@ -389,7 +389,9 @@ app.get('/api/tickets/:id', async (req, res) => {
         LEFT JOIN Users agent ON t.assigned_to_user_id = agent.id
         WHERE t.id = $1`;
     try {
-        const result = await pool.query(sql, [id]);
+        // THE FIX IS HERE:
+        const result = await pool.query(sql, [parseInt(id, 10)]); 
+
         if (!result.rows[0]) {
             return res.status(404).json({ error: 'Ticket not found' });
         }
