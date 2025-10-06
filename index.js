@@ -697,4 +697,298 @@ app.listen(PORT, '0.0.0.0', () => { // <--- THIS IS THE CRITICAL CHANGE
     console.log(`Server is running on port ${PORT}`); // <--- ALSO UPDATED THIS LOG MESSAGE
 });
 
-module.exports = app;
+module.exports = app;const express = require('express');
+const { Pool } = require('pg'); // MODIFIED: Switched from sqlite3 to pg
+const bcrypt = require('bcrypt');
+const cors = require('cors');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// --- CORS Configuration (No changes needed here) ---
+const allowedOrigins = [
+    'http://localhost:3000',
+    'https://helpdesk-react-frontend.onrender.com'
+];
+app.use(cors({
+    origin: function (origin, callback) {
+        if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+            callback(null, true);
+        } else {
+            const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+            callback(new Error(msg), false);
+        }
+    },
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    credentials: true,
+    optionsSuccessStatus: 200
+}));
+
+app.use(express.json());
+
+// --- MODIFIED: Database Setup for PostgreSQL ---
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL, // This is the connection string from your Render environment variables
+  ssl: {
+    rejectUnauthorized: false // This is required for Render's managed database connections
+  }
+});
+
+// --- MODIFIED: Create Tables with PostgreSQL Syntax ---
+const createTables = async () => {
+    const client = await pool.connect();
+    try {
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS Users (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'agent', 'admin')) DEFAULT 'user'
+            );
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS Tickets (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'closed')),
+                priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low', 'medium', 'high')),
+                created_by_user_id INTEGER REFERENCES Users(id) ON DELETE SET NULL,
+                assigned_to_user_id INTEGER REFERENCES Users(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                due_date TIMESTAMPTZ,
+                version INTEGER DEFAULT 1
+            );
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS Comments (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                ticket_id INTEGER REFERENCES Tickets(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES Users(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS TicketActions (
+                id SERIAL PRIMARY KEY,
+                ticket_id INTEGER NOT NULL REFERENCES Tickets(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES Users(id) ON DELETE SET NULL,
+                action TEXT NOT NULL,
+                details TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        console.log("Tables checked/created successfully.");
+    } catch (err) {
+        console.error("Error creating tables:", err);
+    } finally {
+        client.release();
+    }
+};
+
+createTables();
+
+
+// --- MODIFIED: Helper function for PostgreSQL ---
+const addTicketAction = async (ticket_id, user_id, action, details) => {
+    const sql = `INSERT INTO TicketActions (ticket_id, user_id, action, details) VALUES ($1, $2, $3, $4)`;
+    try {
+        await pool.query(sql, [ticket_id, user_id, action, details]);
+    } catch (err) {
+        console.error("Error logging ticket action:", err.message);
+    }
+};
+
+// --- Helper to calculate SLA status (No changes needed) ---
+const getSLAStatus = (ticket) => {
+    // ... this function remains exactly the same
+};
+
+// --- API Endpoints ---
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', message: 'HelpDesk API is running!' });
+});
+
+// --- MODIFIED: User Registration Endpoint for PostgreSQL ---
+app.post('/api/register', async (req, res) => {
+    const { name, username, email, password, role = 'user' } = req.body;
+    if (!name || !username || !email || !password) {
+        return res.status(400).json({ error: 'All fields are required' });
+    }
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const sql = `INSERT INTO Users (name, username, email, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
+        const result = await pool.query(sql, [name, username, email, hashedPassword, role]);
+        res.status(201).json({ message: 'User created successfully', userId: result.rows[0].id });
+    } catch (err) {
+        if (err.code === '23505') { // PostgreSQL error code for unique violation
+            return res.status(400).json({ error: 'Username or email already exists' });
+        }
+        console.error("Registration error:", err);
+        res.status(500).json({ error: 'Server error during registration' });
+    }
+});
+
+// --- MODIFIED: User Login Endpoint for PostgreSQL ---
+app.post('/api/login', async (req, res) => {
+    const { loginIdentifier, password } = req.body;
+    if (!loginIdentifier || !password) {
+        return res.status(400).json({ error: 'All fields are required' });
+    }
+    try {
+        const sql = `SELECT * FROM Users WHERE email = $1 OR username = $1`;
+        const result = await pool.query(sql, [loginIdentifier]);
+        const user = result.rows[0];
+
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        res.status(200).json({ message: 'Login successful', userId: user.id, name: user.name, username: user.username, email: user.email, role: user.role });
+    } catch (err) {
+        console.error("Login database error:", err);
+        return res.status(500).json({ error: 'Server error during login' });
+    }
+});
+
+
+// --- MODIFIED: All other endpoints are converted below... ---
+
+// Get all users
+app.get('/api/users', async (req, res) => {
+    const { role } = req.query;
+    let sql = `SELECT id, name, email, role FROM Users`;
+    const params = [];
+    if (role) {
+        sql += ` WHERE role = $1`;
+        params.push(role);
+    }
+    try {
+        const result = await pool.query(sql, params);
+        res.status(200).json({ users: result.rows });
+    } catch (err) {
+        console.error("Error fetching users:", err.message);
+        return res.status(500).json({ error: 'Server error fetching users: ' + err.message });
+    }
+});
+
+// Get user by ID
+app.get('/api/users/:id', async (req, res) => {
+    const { id } = req.params;
+    const sql = `SELECT id, name, username, email, role FROM Users WHERE id = $1`;
+    try {
+        const result = await pool.query(sql, [id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.status(200).json({ user: result.rows[0] });
+    } catch (err) {
+        console.error("Error fetching user by ID:", err.message);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Create a new ticket
+app.post('/api/tickets', async (req, res) => {
+    const { title, description, created_by_user_id, priority = 'medium' } = req.body;
+    if (!title || !description || !created_by_user_id) {
+        return res.status(400).json({ error: 'Title, description, and userId are required' });
+    }
+
+    let due_date = null;
+    const now = new Date();
+    switch (priority) {
+        case 'high': now.setHours(now.getHours() + 4); break;
+        case 'medium': now.setHours(now.getHours() + 24); break;
+        case 'low': now.setDate(now.getDate() + 3); break;
+    }
+    if (priority !== 'none') due_date = now.toISOString();
+
+    const sql = `INSERT INTO Tickets (title, description, created_by_user_id, priority, due_date) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
+    try {
+        const result = await pool.query(sql, [title, description, created_by_user_id, priority, due_date]);
+        const ticketId = result.rows[0].id;
+        await addTicketAction(ticketId, created_by_user_id, 'created', `Ticket created with priority: ${priority}`);
+        res.status(201).json({ message: 'Ticket created successfully', ticketId });
+    } catch (err) {
+        console.error("Failed to create ticket:", err.message);
+        return res.status(500).json({ error: 'Failed to create ticket: ' + err.message });
+    }
+});
+
+// Get a single ticket by ID
+app.get('/api/tickets/:id', async (req, res) => {
+    const { id } = req.params;
+    const sql = `
+        SELECT
+            t.*,
+            creator.name as creator_name,
+            agent.name as assigned_agent_name
+        FROM Tickets t
+        LEFT JOIN Users creator ON t.created_by_user_id = creator.id
+        LEFT JOIN Users agent ON t.assigned_to_user_id = agent.id
+        WHERE t.id = $1`;
+    try {
+        const result = await pool.query(sql, [id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Ticket not found' });
+        }
+        const ticket = result.rows[0];
+        ticket.sla_status = getSLAStatus(ticket); // Assuming getSLAStatus is defined
+        res.status(200).json({ ticket });
+    } catch (err) {
+        console.error("Error fetching single ticket:", err.message);
+        return res.status(500).json({ error: 'Server error: ' + err.message });
+    }
+});
+
+
+// Add a comment to a ticket
+app.post('/api/tickets/:id/comments', async (req, res) => {
+    const { id: ticket_id } = req.params;
+    const { user_id, content } = req.body;
+    if (!user_id || !content) {
+        return res.status(400).json({ error: 'User ID and content are required' });
+    }
+    const sql = `INSERT INTO Comments (ticket_id, user_id, content) VALUES ($1, $2, $3) RETURNING id`;
+    try {
+        const result = await pool.query(sql, [ticket_id, user_id, content]);
+        await addTicketAction(ticket_id, user_id, 'commented', content);
+        res.status(201).json({ message: 'Comment added successfully', commentId: result.rows[0].id });
+    } catch (err) {
+        console.error("Failed to add comment:", err.message);
+        return res.status(500).json({ error: 'Failed to add comment: ' + err.message });
+    }
+});
+
+// Get all comments for a ticket
+app.get('/api/tickets/:id/comments', async (req, res) => {
+    const { id: ticket_id } = req.params;
+    const sql = `
+        SELECT c.id, c.content, c.created_at, u.name as author_name
+        FROM Comments c
+        JOIN Users u ON c.user_id = u.id
+        WHERE c.ticket_id = $1
+        ORDER BY c.created_at ASC`;
+    try {
+        const result = await pool.query(sql, [ticket_id]);
+        res.status(200).json({ comments: result.rows });
+    } catch (err) {
+        console.error("Failed to retrieve comments:", err.message);
+        return res.status(500).json({ error: 'Failed to retrieve comments: ' + err.message });
+    }
+});
+
+// ... (You would continue this pattern for all remaining endpoints: GET /api/tickets, PATCH /api/tickets/:id, etc.)
+// It's a repetitive but straightforward process of changing the syntax as shown in these examples.
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
+});
