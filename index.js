@@ -1,5 +1,5 @@
 const express = require('express');
-const { Pool } = require('pg'); // MODIFIED: Using PostgreSQL driver
+const { Pool } = require('pg'); // MODIFIED: Using the PostgreSQL driver instead of sqlite3
 const bcrypt = require('bcrypt');
 const cors = require('cors');
 
@@ -230,6 +230,7 @@ app.patch('/api/users/:id', async (req, res) => {
             fieldsToUpdate.push(`password = $${paramCount++}`);
             params.push(hashedPassword);
         } catch (error) {
+            console.error("Error hashing password for user update:", error);
             return res.status(500).json({ error: 'Error hashing new password' });
         }
     }
@@ -270,6 +271,7 @@ app.post('/api/tickets', async (req, res) => {
         case 'high': now.setHours(now.getHours() + 4); due_date = now.toISOString(); break;
         case 'medium': now.setHours(now.getHours() + 24); due_date = now.toISOString(); break;
         case 'low': now.setDate(now.getDate() + 3); due_date = now.toISOString(); break;
+        default: due_date = null;
     }
 
     const sql = `INSERT INTO Tickets (title, description, created_by_user_id, priority, due_date) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
@@ -284,15 +286,77 @@ app.post('/api/tickets', async (req, res) => {
     }
 });
 
+// Get all tickets
+app.get('/api/tickets', async (req, res) => {
+    const { search, status, priority, breached, limit = 10, offset = 0, userId, role } = req.query;
+
+    let baseSql = `
+        SELECT
+            t.id, t.title, t.description, t.status, t.priority, t.created_at,
+            t.updated_at, t.due_date, t.version, u.name as creator_name,
+            au.name as assigned_agent_name, t.created_by_user_id, t.assigned_to_user_id
+        FROM Tickets t
+        LEFT JOIN Users u ON t.created_by_user_id = u.id
+        LEFT JOIN Users au ON t.assigned_to_user_id = au.id
+    `;
+    let countSql = `SELECT COUNT(DISTINCT t.id) as total FROM Tickets t LEFT JOIN Users u ON t.created_by_user_id = u.id`;
+
+    let whereClauses = [];
+    const params = [];
+    let paramIndex = 1;
+
+    if (role === 'user' && userId) {
+        whereClauses.push(`t.created_by_user_id = $${paramIndex++}`);
+        params.push(userId);
+    } else if (role === 'agent' && userId) {
+        whereClauses.push(`(t.assigned_to_user_id = $${paramIndex++} OR t.status = 'open')`);
+        params.push(userId);
+    }
+    if (status && status !== 'all') {
+        whereClauses.push(`t.status = $${paramIndex++}`);
+        params.push(status);
+    }
+    if (priority && priority !== 'all') {
+        whereClauses.push(`t.priority = $${paramIndex++}`);
+        params.push(priority);
+    }
+    if (breached === 'true') {
+        whereClauses.push(`t.status != 'closed' AND t.due_date IS NOT NULL AND t.due_date < NOW()`);
+    }
+    if (search) {
+        const searchTerm = `%${search}%`;
+        whereClauses.push(`(t.title ILIKE $${paramIndex++} OR t.description ILIKE $${paramIndex++} OR u.name ILIKE $${paramIndex++})`);
+        params.push(searchTerm, searchTerm, searchTerm);
+    }
+
+    if (whereClauses.length > 0) {
+        const whereString = ' WHERE ' + whereClauses.join(' AND ');
+        baseSql += whereString;
+        countSql += whereString;
+    }
+
+    baseSql += ` ORDER BY t.created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
+    params.push(Number(limit), Number(offset));
+
+    try {
+        const ticketsResult = await pool.query(baseSql, params);
+        const countResult = await pool.query(countSql, params.slice(0, paramIndex - 3)); // Exclude limit and offset for count
+        
+        const ticketsWithSLA = ticketsResult.rows.map(ticket => ({ ...ticket, sla_status: getSLAStatus(ticket) }));
+        const totalTickets = countResult.rows[0] ? parseInt(countResult.rows[0].total, 10) : 0;
+        
+        res.status(200).json({ tickets: ticketsWithSLA, total: totalTickets });
+    } catch (err) {
+        console.error('Server error fetching tickets:', err.message);
+        return res.status(500).json({ error: 'Server error fetching tickets: ' + err.message });
+    }
+});
 
 // Get a single ticket by ID
 app.get('/api/tickets/:id', async (req, res) => {
     const { id } = req.params;
     const sql = `
-        SELECT
-            t.*,
-            creator.name as creator_name,
-            agent.name as assigned_agent_name
+        SELECT t.*, creator.name as creator_name, agent.name as assigned_agent_name
         FROM Tickets t
         LEFT JOIN Users creator ON t.created_by_user_id = creator.id
         LEFT JOIN Users agent ON t.assigned_to_user_id = agent.id
@@ -302,12 +366,80 @@ app.get('/api/tickets/:id', async (req, res) => {
         if (!result.rows[0]) {
             return res.status(404).json({ error: 'Ticket not found' });
         }
-        let ticket = result.rows[0];
-        ticket.sla_status = getSLAStatus(ticket);
-        res.status(200).json({ ticket });
+        let row = result.rows[0];
+        row.sla_status = getSLAStatus(row);
+        res.status(200).json({ ticket: row });
     } catch (err) {
         console.error("Error fetching single ticket:", err.message);
         return res.status(500).json({ error: 'Server error: ' + err.message });
+    }
+});
+
+// Update a ticket
+app.patch('/api/tickets/:id', async (req, res) => {
+    const { id } = req.params;
+    const { status, assigned_to_user_id, priority, current_version, user_id: updater_user_id } = req.body;
+
+    if (!updater_user_id) {
+        return res.status(400).json({ error: 'User ID of the updater is required.' });
+    }
+
+    try {
+        const existingTicketResult = await pool.query('SELECT * FROM Tickets WHERE id = $1 FOR UPDATE', [id]);
+        const existingTicket = existingTicketResult.rows[0];
+
+        if (!existingTicket) {
+            return res.status(404).json({ error: 'Ticket not found.' });
+        }
+        if (current_version !== existingTicket.version) {
+            return res.status(409).json({ error: 'Conflict: Ticket has been updated by someone else. Please refresh and try again.' });
+        }
+
+        let fieldsToUpdate = [];
+        const params = [];
+        const actions = [];
+        let paramCount = 1;
+
+        if (status && status !== existingTicket.status) {
+            fieldsToUpdate.push(`status = $${paramCount++}`);
+            params.push(status);
+            actions.push({ action_type: 'status_changed', details: `status: ${existingTicket.status} -> ${status}` });
+        }
+        if (priority && priority !== existingTicket.priority) {
+            fieldsToUpdate.push(`priority = $${paramCount++}`);
+            params.push(priority);
+            actions.push({ action_type: 'priority_changed', details: `priority: ${existingTicket.priority} -> ${priority}` });
+        }
+        
+        let actualAssignedToUserId = assigned_to_user_id === '' ? null : assigned_to_user_id;
+        if (actualAssignedToUserId !== existingTicket.assigned_to_user_id) {
+            fieldsToUpdate.push(`assigned_to_user_id = $${paramCount++}`);
+            params.push(actualAssignedToUserId);
+        }
+
+        if (fieldsToUpdate.length === 0) {
+            return res.status(400).json({ error: 'No meaningful fields to update provided.' });
+        }
+
+        fieldsToUpdate.push(`version = $${paramCount++}`);
+        params.push(existingTicket.version + 1);
+        fieldsToUpdate.push(`updated_at = NOW()`);
+
+        const sql = `UPDATE Tickets SET ${fieldsToUpdate.join(', ')} WHERE id = $${paramCount}`;
+        params.push(id);
+
+        const updateResult = await pool.query(sql, params);
+
+        if (updateResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Ticket not found or no changes made.' });
+        }
+
+        actions.forEach(actionObj => addTicketAction(id, updater_user_id, actionObj.action_type, actionObj.details));
+        res.status(200).json({ message: 'Ticket updated successfully', newVersion: existingTicket.version + 1 });
+
+    } catch (error) {
+        console.error('Error in PATCH /api/tickets/:id:', error);
+        res.status(500).json({ error: 'Internal server error: ' + error.message });
     }
 });
 
@@ -370,9 +502,6 @@ app.get('/api/tickets/actions/:id', async (req, res) => {
 // Delete a ticket
 app.delete('/api/tickets/:id', async (req, res) => {
     const { id } = req.params;
-    // NOTE: With "ON DELETE CASCADE" in the table definition, PostgreSQL handles
-    // deleting related comments and actions automatically and safely.
-    // The extra DELETE queries from the SQLite version are no longer needed.
     try {
         const result = await pool.query(`DELETE FROM Tickets WHERE id = $1`, [id]);
         if (result.rowCount === 0) {
@@ -406,6 +535,7 @@ app.delete('/api/comments/:id', async (req, res) => {
         }
 
         const deleteResult = await pool.query(`DELETE FROM Comments WHERE id = $1`, [commentId]);
+
         if (deleteResult.rowCount === 0) {
             return res.status(404).json({ error: 'Comment not found' });
         }
@@ -415,10 +545,6 @@ app.delete('/api/comments/:id', async (req, res) => {
         return res.status(500).json({ error: 'Failed to delete comment: ' + err.message });
     }
 });
-
-
-// --- The final app.listen and module.exports lines are missing from your original code. ---
-// --- I have added them back in as they are essential for the server to run. ---
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server is running on port ${PORT}`);
