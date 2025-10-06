@@ -38,7 +38,6 @@ const pool = new Pool({
 });
 
 // --- MODIFIED: Create Tables with PostgreSQL Syntax ---
-// This runs once on startup to ensure your tables exist.
 const setupDatabase = async () => {
     const client = await pool.connect();
     try {
@@ -125,13 +124,11 @@ app.get('/api/setup-admin-user-temp', async (req, res) => {
     const role = 'admin';
 
     try {
-        // First, check if the admin user already exists
         const existingUser = await pool.query('SELECT * FROM Users WHERE username = $1 OR email = $2', [username, email]);
         if (existingUser.rows.length > 0) {
             return res.status(409).send('Admin user already exists.');
         }
 
-        // If not, create the user
         const hashedPassword = await bcrypt.hash(password, 10);
         const sql = `INSERT INTO Users (name, username, email, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
         await pool.query(sql, [name, username, email, hashedPassword, role]);
@@ -160,7 +157,7 @@ app.post('/api/register', async (req, res) => {
         const result = await pool.query(sql, [name, username, email, hashedPassword, role]);
         res.status(201).json({ message: 'User created successfully', userId: result.rows[0].id });
     } catch (err) {
-        if (err.code === '23505') { // PostgreSQL's unique violation code
+        if (err.code === '23505') {
             return res.status(400).json({ error: 'Username or email already exists' });
         }
         console.error("Registration error:", err);
@@ -366,7 +363,7 @@ app.get('/api/tickets', async (req, res) => {
     
     try {
         const ticketsResult = await pool.query(baseSql, finalParams);
-        const countResult = await pool.query(countSql, params); // Use original params for count
+        const countResult = await pool.query(countSql, params);
         
         const ticketsWithSLA = ticketsResult.rows.map(ticket => ({ ...ticket, sla_status: getSLAStatus(ticket) }));
         const totalTickets = countResult.rows[0] ? parseInt(countResult.rows[0].total, 10) : 0;
@@ -380,7 +377,8 @@ app.get('/api/tickets', async (req, res) => {
 
 
 // Get a single ticket by ID
-aapp.get('/api/tickets/:id', async (req, res) => {
+// MODIFIED: Corrected the typo from 'aapp' to 'app'
+app.get('/api/tickets/:id', async (req, res) => {
     const { id } = req.params;
     const sql = `
         SELECT t.*, creator.name as creator_name, agent.name as assigned_agent_name
@@ -389,7 +387,6 @@ aapp.get('/api/tickets/:id', async (req, res) => {
         LEFT JOIN Users agent ON t.assigned_to_user_id = agent.id
         WHERE t.id = $1`;
     try {
-        // THE FIX IS HERE:
         const result = await pool.query(sql, [parseInt(id, 10)]); 
 
         if (!result.rows[0]) {
@@ -444,7 +441,6 @@ app.patch('/api/tickets/:id', async (req, res) => {
         if (actualAssignedToUserId !== existingTicket.assigned_to_user_id) {
             fieldsToUpdate.push(`assigned_to_user_id = $${paramCount++}`);
             params.push(actualAssignedToUserId);
-            // In a real app, you might fetch the user's name to add to the action log
             actions.push({ action_type: 'assigned', details: `assigned to user ID: ${actualAssignedToUserId || 'unassigned'}` });
         }
 
@@ -582,3 +578,4 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 module.exports = app;
+
